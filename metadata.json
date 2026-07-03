@@ -1,0 +1,6 @@
+{
+  "name": "WebRTC File Transfer",
+  "description": "A premium macOS-inspired peer-to-peer file transfer application using WebRTC DataChannel for secure high-speed transfers and Supabase Realtime for automatic signaling.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

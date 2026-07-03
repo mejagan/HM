@@ -1,0 +1,91 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: var(--font-sans), system-ui, -apple-system, sans-serif;
+  --font-mono: var(--font-mono), monospace;
+}
+
+/* Custom background style mimicking macOS ambient desktop lighting */
+body {
+  background-color: #050505;
+  background-image: 
+    radial-gradient(circle at 50% -20%, rgba(120, 119, 198, 0.15) 0%, transparent 60%),
+    radial-gradient(circle at 0% 0%, rgba(74, 144, 226, 0.08) 0%, transparent 40%),
+    radial-gradient(circle at 100% 100%, rgba(144, 58, 255, 0.08) 0%, transparent 40%);
+  background-attachment: fixed;
+  min-height: 100vh;
+}
+
+/* Custom glassmorphism helpers */
+.glass-panel {
+  background: rgba(23, 23, 23, 0.6);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+}
+
+.glass-button {
+  background: rgba(255, 255, 255, 0.05);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.glass-button:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.15);
+  transform: translateY(-1px);
+}
+
+.glass-button:active {
+  background: rgba(255, 255, 255, 0.03);
+  transform: translateY(1px);
+}
+
+/* Scrollbar styles */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Scanning Animation Keyframes */
+@keyframes scan {
+  0% {
+    top: 4%;
+  }
+  50% {
+    top: 96%;
+  }
+  100% {
+    top: 4%;
+  }
+}
+
+.animate-scan {
+  animation: scan 2s infinite linear;
+}
+
+#qr-reader {
+  border: none !important;
+}
+
+#qr-reader video {
+  width: 100% !important;
+  height: 100% !important;
+  object-fit: cover !important;
+  border-radius: 1rem !important;
+}
+
+
