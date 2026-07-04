@@ -43,7 +43,8 @@ import {
   Copy,
   Check,
   Camera,
-  CameraOff
+  CameraOff,
+  Plus
 } from 'lucide-react';
 
 // Define transfer metrics state structure
@@ -88,6 +89,15 @@ export default function Home() {
   const [isScanning, setIsScanning] = useState(false);
   const [supabaseConfig, setSupabaseConfig] = useState<{ url: string; key: string } | null>(null);
   const [debugLogs, setDebugLogs] = useState<{time: string; text: string; type: 'info' | 'success' | 'warn' | 'error'}[]>([]);
+  const [downloadQueue, setDownloadQueue] = useState<{
+    id: string;
+    name: string;
+    size: number;
+    type: string;
+    chunks: ArrayBuffer[];
+    downloaded: boolean;
+    receivedBytes: number;
+  }[]>([]);
 
   // --- REFS ---
   const supabaseClientRef = useRef<SupabaseClient | null>(null);
@@ -104,6 +114,10 @@ export default function Home() {
   const statusRef = useRef<string>('home');
   const roomCodeRef = useRef<string>('');
   const joinRoomChannelRef = useRef<any>(null);
+  const isSubscribedRef = useRef<boolean>(false);
+  const outgoingSignalingQueueRef = useRef<any[]>([]);
+  const incomingSignalingQueueRef = useRef<any[]>([]);
+  const subscriptionRetryTimeoutRef = useRef<any>(null);
   const inputRefs = [
     useRef<HTMLInputElement | null>(null),
     useRef<HTMLInputElement | null>(null),
@@ -117,6 +131,24 @@ export default function Home() {
     console.log(`[DEBUG] [${type.toUpperCase()}] ${text}`);
     setDebugLogs((prev) => [...prev.slice(-99), { time, text, type }]);
   }, []);
+
+  // --- SIGNAL SENDER (QUEUED / RECOVERABLE) ---
+  const sendSignalMessage = useCallback((payload: any) => {
+    if (isSubscribedRef.current && channelRef.current) {
+      addDebugLog(`Broadcasting signal immediately: "${payload?.type}"`, 'info');
+      channelRef.current.send({
+        type: 'broadcast',
+        event: 'signal',
+        payload,
+      }).catch((err) => {
+        console.error('Error sending signal:', err);
+        addDebugLog(`Failed to broadcast signal: ${err.message || err}`, 'error');
+      });
+    } else {
+      addDebugLog(`Signaling channel not fully subscribed. Queuing outgoing signal: "${payload?.type}"`, 'warn');
+      outgoingSignalingQueueRef.current.push(payload);
+    }
+  }, [addDebugLog]);
 
   // --- RUNTIME SUPABASE CONFIGURATION FETCH ---
   useEffect(() => {
@@ -309,14 +341,7 @@ export default function Home() {
   const handleDisconnect = useCallback((notify: boolean, isIntentional = false) => {
     // 1. Notify peer if required
     if (notify) {
-      const channel = channelRef.current;
-      if (channel) {
-        channel.send({
-          type: 'broadcast',
-          event: 'signal',
-          payload: {type: isIntentional ? 'intentional-disconnect' : 'webrtc-failed'},
-        }).catch((err) => console.error('Error sending disconnect signal:', err));
-      }
+      sendSignalMessage({type: isIntentional ? 'intentional-disconnect' : 'webrtc-failed'});
     }
 
     // 2. Abort file reading
@@ -356,6 +381,13 @@ export default function Home() {
 
     // 6. Reset states
     if (isIntentional) {
+      isSubscribedRef.current = false;
+      outgoingSignalingQueueRef.current = [];
+      incomingSignalingQueueRef.current = [];
+      if (subscriptionRetryTimeoutRef.current) {
+        clearTimeout(subscriptionRetryTimeoutRef.current);
+        subscriptionRetryTimeoutRef.current = null;
+      }
       if (joinRetryIntervalRef.current) {
         clearInterval(joinRetryIntervalRef.current);
         joinRetryIntervalRef.current = null;
@@ -364,6 +396,7 @@ export default function Home() {
       setInputCode(['', '', '', '']);
       setRole(null);
       setStatus('home');
+      setDownloadQueue([]);
       if (html5QrCodeScannerRef.current) {
         try {
           if (html5QrCodeScannerRef.current.isScanning) {
@@ -396,7 +429,7 @@ export default function Home() {
     setIsConnected(false);
     chunksReceivedRef.current = [];
     receivedMetadataRef.current = null;
-  }, [addDebugLog, setRole]);
+  }, [addDebugLog, setRole, setDownloadQueue, sendSignalMessage]);
 
   // --- AUTOMATIC CLEANUP ON UNMOUNT ---
   useEffect(() => {
@@ -539,12 +572,31 @@ export default function Home() {
 
           if (receivedBytes >= meta.size) {
             addDebugLog('All file chunks received completely!', 'success');
+
+            const newFileId = Math.random().toString(36).substring(2, 9);
+            const newQueuedFile = {
+              id: newFileId,
+              name: meta.name,
+              size: meta.size,
+              type: meta.type || 'application/octet-stream',
+              chunks: [...chunksReceivedRef.current],
+              downloaded: false,
+              receivedBytes: receivedBytes,
+            };
+
+            setDownloadQueue((prev) => {
+              if (prev.some(f => f.name === meta.name && f.size === meta.size && f.chunks.length === chunksReceivedRef.current.length)) {
+                return prev;
+              }
+              return [...prev, newQueuedFile];
+            });
+
             setStatus('complete');
           }
         }
       }
     };
-  }, [handleDisconnect, addDebugLog]);
+  }, [handleDisconnect, addDebugLog, setDownloadQueue]);
 
   // --- RECEIVER ANSWER CREATION ---
   const handleOffer = useCallback(async (sdp: RTCSessionDescriptionInit) => {
@@ -570,15 +622,9 @@ export default function Home() {
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         addDebugLog(`[receiver] Gathered local ICE candidate: ${event.candidate.candidate.substring(0, 40)}...`, 'info');
-        if (channelRef.current) {
-          addDebugLog('[receiver] Broadcasting gathered local ICE candidate...', 'info');
-          const candJson = event.candidate.toJSON();
-          channelRef.current.send({
-            type: 'broadcast',
-            event: 'signal',
-            payload: {type: 'candidate', candidate: candJson},
-          }).catch((err) => console.error('Error sending candidate:', err));
-        }
+        addDebugLog('[receiver] Broadcasting gathered local ICE candidate...', 'info');
+        const candJson = event.candidate.toJSON();
+        sendSignalMessage({type: 'candidate', candidate: candJson});
       } else {
         addDebugLog('[receiver] Completed local ICE candidate gathering.', 'success');
       }
@@ -615,15 +661,9 @@ export default function Home() {
     await pc.setLocalDescription(answer);
     addDebugLog('[receiver] SDP Answer created and set locally.', 'success');
 
-    if (channelRef.current) {
-      addDebugLog('[receiver] Broadcasting SDP Answer...', 'info');
-      await channelRef.current.send({
-        type: 'broadcast',
-        event: 'signal',
-        payload: {type: 'answer', sdp: answer},
-      });
-    }
-  }, [getIceServers, setupReceiverDataChannel, setupPeerConnectionListeners, addDebugLog]);
+    addDebugLog('[receiver] Broadcasting SDP Answer...', 'info');
+    sendSignalMessage({type: 'answer', sdp: answer});
+  }, [getIceServers, setupReceiverDataChannel, setupPeerConnectionListeners, addDebugLog, sendSignalMessage]);
 
   // --- SENDER INITIATE CONNECTION ---
   const initiatePeerConnection = useCallback(async () => {
@@ -642,15 +682,9 @@ export default function Home() {
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         addDebugLog(`[sender] Gathered local ICE candidate: ${event.candidate.candidate.substring(0, 40)}...`, 'info');
-        if (channelRef.current) {
-          addDebugLog('[sender] Broadcasting gathered local ICE candidate...', 'info');
-          const candJson = event.candidate.toJSON();
-          channelRef.current.send({
-            type: 'broadcast',
-            event: 'signal',
-            payload: {type: 'candidate', candidate: candJson},
-          }).catch((err) => console.error('Error sending candidate:', err));
-        }
+        addDebugLog('[sender] Broadcasting gathered local ICE candidate...', 'info');
+        const candJson = event.candidate.toJSON();
+        sendSignalMessage({type: 'candidate', candidate: candJson});
       } else {
         addDebugLog('[sender] Completed local ICE candidate gathering.', 'success');
       }
@@ -685,15 +719,9 @@ export default function Home() {
     await pc.setLocalDescription(offer);
     addDebugLog('[sender] SDP Offer created and set locally.', 'success');
 
-    if (channelRef.current) {
-      addDebugLog('[sender] Broadcasting SDP Offer...', 'info');
-      await channelRef.current.send({
-        type: 'broadcast',
-        event: 'signal',
-        payload: {type: 'offer', sdp: offer},
-      });
-    }
-  }, [getIceServers, handleDisconnect, setupPeerConnectionListeners, addDebugLog]);
+    addDebugLog('[sender] Broadcasting SDP Offer...', 'info');
+    sendSignalMessage({type: 'offer', sdp: offer});
+  }, [getIceServers, handleDisconnect, setupPeerConnectionListeners, addDebugLog, sendSignalMessage]);
 
   // --- SIGNAL ROUTER (BROADCAST HANDLER) ---
   const handleSignalMessage = useCallback(async (payload: any) => {
@@ -712,13 +740,7 @@ export default function Home() {
           }
           if (pc.localDescription && pc.localDescription.type === 'offer') {
             addDebugLog('Negotiation in progress. Re-broadcasting existing SDP Offer...', 'warn');
-            if (channelRef.current) {
-              await channelRef.current.send({
-                type: 'broadcast',
-                event: 'signal',
-                payload: {type: 'offer', sdp: pc.localDescription},
-              });
-            }
+            sendSignalMessage({type: 'offer', sdp: pc.localDescription});
             return;
           }
           addDebugLog('PeerConnection exists but is inactive. Closing and recreating...', 'warn');
@@ -736,13 +758,7 @@ export default function Home() {
           }
           if (pc.localDescription && pc.localDescription.type === 'answer') {
             addDebugLog('Already set remote offer and local answer. Re-broadcasting SDP Answer...', 'warn');
-            if (channelRef.current) {
-              await channelRef.current.send({
-                type: 'broadcast',
-                event: 'signal',
-                payload: {type: 'answer', sdp: pc.localDescription},
-              });
-            }
+            sendSignalMessage({type: 'answer', sdp: pc.localDescription});
             return;
           }
           addDebugLog('PeerConnection exists but not negotiated. Closing and recreating...', 'warn');
@@ -799,15 +815,14 @@ export default function Home() {
         addDebugLog('Remote peer reported connection failure/reset. Attempting to keep signaling channel alive.', 'warn');
         handleDisconnect(false, false); // Soft/Non-intentional disconnect
       } else if (payload.type === 'download-complete') {
-        addDebugLog('Receiver completed file download signal received. Resetting.', 'success');
-        handleDisconnect(false, false); // Soft reset
+        addDebugLog('Receiver completed file download signal received.', 'success');
       }
     } catch (err: any) {
       console.error('Error processing signaling message:', err);
       addDebugLog(`Connection handshake failed: ${err.message || err}`, 'error');
       setError(`Connection handshake failed: ${err.message || err}`);
     }
-  }, [initiatePeerConnection, handleOffer, handleDisconnect, addDebugLog]);
+  }, [initiatePeerConnection, handleOffer, handleDisconnect, addDebugLog, sendSignalMessage]);
 
   // Sync handleSignalMessage callback to ref to avoid stale closure issues in the event listener
   useEffect(() => {
@@ -815,8 +830,8 @@ export default function Home() {
   }, [handleSignalMessage]);
 
   // --- CHANNEL SUBSCRIPTION & JOIN ---
-  const joinRoomChannel = useCallback((code: string, currentRole: 'sender' | 'receiver') => {
-    addDebugLog(`Attempting to join signaling room: ${code} as ${currentRole}...`, 'info');
+  const joinRoomChannel = useCallback((code: string, currentRole: 'sender' | 'receiver', retryAttempt = 0) => {
+    addDebugLog(`Attempting to join signaling room: ${code} as ${currentRole} (attempt ${retryAttempt})...`, 'info');
     const supabase = getSupabaseClientInstance();
     if (!supabase) {
       addDebugLog('Failed to obtain a valid Supabase client instance. Check configuration.', 'error');
@@ -827,6 +842,16 @@ export default function Home() {
     }
 
     supabaseClientRef.current = supabase;
+
+    // Reset subscription state and queues for room isolation
+    isSubscribedRef.current = false;
+    outgoingSignalingQueueRef.current = [];
+    incomingSignalingQueueRef.current = [];
+
+    if (subscriptionRetryTimeoutRef.current) {
+      clearTimeout(subscriptionRetryTimeoutRef.current);
+      subscriptionRetryTimeoutRef.current = null;
+    }
 
     // Clean up any existing channel before subscribing to a new one
     if (channelRef.current) {
@@ -850,28 +875,56 @@ export default function Home() {
     channel
       .on('broadcast', {event: 'signal'}, ({payload}) => {
         addDebugLog(`Supabase Realtime received signal: "${payload?.type}"`, 'success');
-        if (handleSignalMessageRef.current) {
-          handleSignalMessageRef.current(payload);
+        if (isSubscribedRef.current) {
+          if (handleSignalMessageRef.current) {
+            handleSignalMessageRef.current(payload);
+          }
+        } else {
+          addDebugLog(`Channel not fully subscribed yet. Queuing incoming signal: "${payload?.type}"`, 'warn');
+          incomingSignalingQueueRef.current.push(payload);
         }
       })
-      .subscribe((status) => {
-        addDebugLog(`Supabase Realtime subscription status: ${status}`, status === 'SUBSCRIBED' ? 'success' : 'warn');
+      .subscribe((status, err) => {
+        addDebugLog(`Supabase Realtime subscription status: ${status}${err ? ` - Error: ${JSON.stringify(err)}` : ''}`, status === 'SUBSCRIBED' ? 'success' : 'warn');
+        
         if (status === 'SUBSCRIBED') {
           addDebugLog(`Successfully subscribed to signaling room channel: ${code}`, 'success');
+          isSubscribedRef.current = true;
+
+          // 1. Process queued incoming signals first
+          const incoming = [...incomingSignalingQueueRef.current];
+          incomingSignalingQueueRef.current = [];
+          if (incoming.length > 0) {
+            addDebugLog(`Processing ${incoming.length} queued incoming signal(s)...`, 'info');
+            incoming.forEach((pay) => {
+              if (handleSignalMessageRef.current) {
+                handleSignalMessageRef.current(pay);
+              }
+            });
+          }
+
+          // 2. Flush queued outgoing signals
+          const outgoing = [...outgoingSignalingQueueRef.current];
+          outgoingSignalingQueueRef.current = [];
+          if (outgoing.length > 0) {
+            addDebugLog(`Broadcasting ${outgoing.length} queued outgoing signal(s)...`, 'info');
+            outgoing.forEach((pay) => {
+              channel.send({
+                type: 'broadcast',
+                event: 'signal',
+                payload: pay,
+              }).catch((e) => {
+                console.error('Error sending queued signal:', e);
+                addDebugLog(`Failed to send queued signal: ${e.message || e}`, 'error');
+              });
+            });
+          }
+
+          // 3. Setup join/negotiation routine for receiver
           if (currentRole === 'receiver') {
             // Automatically prompt sender to start WebRTC creation
             addDebugLog(`Broadcasting 'join' signal to room ${code}...`, 'info');
-            channel.send({
-              type: 'broadcast',
-              event: 'signal',
-              payload: {type: 'join'},
-            }).then((resp) => {
-              addDebugLog(`Broadcasted 'join' signal response: ${resp}`, resp === 'ok' ? 'success' : 'warn');
-            }).catch((err) => {
-              console.error('Error broadcasting join:', err);
-              addDebugLog(`Failed to broadcast 'join' signal: ${err.message || err}`, 'error');
-              setError('Failed to contact sender. Retrying...');
-            });
+            sendSignalMessage({type: 'join'});
 
             // Setup robust join interval to retry until sender responds with an offer
             if (joinRetryIntervalRef.current) {
@@ -891,38 +944,37 @@ export default function Home() {
 
               attempt++;
               addDebugLog(`Retrying 'join' signal broadcast (attempt ${attempt})...`, 'info');
-              channel.send({
-                type: 'broadcast',
-                event: 'signal',
-                payload: {type: 'join'},
-              }).catch((e) => {
-                addDebugLog(`Retry 'join' broadcast failed: ${e.message || e}`, 'error');
-              });
+              sendSignalMessage({type: 'join'});
             }, 2500);
           }
-        } else if (status === 'CHANNEL_ERROR' || status === 'CLOSED') {
-          addDebugLog(`Channel error or closed. Status is: ${status}`, 'error');
+        } else if (status === 'CHANNEL_ERROR' || status === 'CLOSED' || status === 'TIMED_OUT') {
+          addDebugLog(`Channel error/close/timeout. Status is: ${status}`, 'error');
+          isSubscribedRef.current = false;
           
-          // Reconnection logic: if status is not 'home', try to automatically re-subscribe
-          const currentStatus = statusRef.current;
-          if (currentStatus !== 'home') {
-            const activeCode = roomCodeRef.current;
-            const activeRole = roleRef.current;
-            if (activeCode && activeRole) {
-              addDebugLog(`Recreating Supabase signaling channel for room ${activeCode} in 3 seconds...`, 'warn');
-              setError('Signaling network error. Retrying connection...');
-              setTimeout(() => {
-                if (statusRef.current !== 'home' && roomCodeRef.current === activeCode && joinRoomChannelRef.current) {
-                  joinRoomChannelRef.current(activeCode, activeRole);
+          // Only retry if we are still active in this room and didn't go back home
+          if (statusRef.current !== 'home' && roomCodeRef.current === code) {
+            const maxRetries = 6;
+            if (retryAttempt < maxRetries) {
+              const delay = Math.min(15000, Math.pow(2, retryAttempt) * 1000 + Math.random() * 500);
+              addDebugLog(`Subscription failed/timed out. Automatically retrying in ${(delay / 1000).toFixed(1)}s (Attempt ${retryAttempt + 1}/${maxRetries}) with exponential backoff...`, 'warn');
+              setError(`Signaling connection issue (attempting retry ${retryAttempt + 1}/${maxRetries})...`);
+              
+              if (subscriptionRetryTimeoutRef.current) {
+                clearTimeout(subscriptionRetryTimeoutRef.current);
+              }
+              subscriptionRetryTimeoutRef.current = setTimeout(() => {
+                if (statusRef.current !== 'home' && roomCodeRef.current === code && joinRoomChannelRef.current) {
+                  joinRoomChannelRef.current(code, currentRole, retryAttempt + 1);
                 }
-              }, 3000);
+              }, delay);
+            } else {
+              addDebugLog('Reached max subscription retry attempts. Connection failed.', 'error');
+              setError('Connection failed. Please check your internet or try creating/joining a different room.');
             }
-          } else {
-            setError('Signaling network error. Please verify connection and retry.');
           }
         }
       });
-  }, [getSupabaseClientInstance, addDebugLog, setRole]);
+  }, [getSupabaseClientInstance, addDebugLog, setRole, sendSignalMessage]);
 
   useEffect(() => {
     joinRoomChannelRef.current = joinRoomChannel;
@@ -1179,18 +1231,49 @@ export default function Home() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
 
     // Notify sender that receiver downloaded
-    const channel = channelRef.current;
-    if (channel) {
-      channel.send({
-        type: 'broadcast',
-        event: 'signal',
-        payload: {type: 'download-complete'},
-      }).catch((err) => console.error('Error broadcasting download complete:', err));
+    sendSignalMessage({type: 'download-complete'});
+
+    // Mark the file as downloaded in the queue
+    setDownloadQueue((prev) =>
+      prev.map((f) => f.name === meta.name && f.size === meta.size ? { ...f, downloaded: true } : f)
+    );
+
+    // Keep the session connected: return to connected status so they can wait/view more files
+    setStatus('connected');
+  };
+
+  const downloadSingleFile = useCallback((file: { id: string; name: string; size: number; type: string; chunks: ArrayBuffer[]; downloaded: boolean; receivedBytes: number }) => {
+    if (!file || file.chunks.length === 0) {
+      setError('No file segments found to download.');
+      return;
     }
 
-    // Smooth local reset
-    handleDisconnect(false, false);
-  };
+    const blob = new Blob(file.chunks, {type: file.type || 'application/octet-stream'});
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = file.name;
+    a.click();
+
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+
+    // Notify sender that receiver downloaded
+    sendSignalMessage({type: 'download-complete'});
+
+    // Mark as downloaded in the queue
+    setDownloadQueue((prev) =>
+      prev.map((f) => f.id === file.id ? { ...f, downloaded: true } : f)
+    );
+  }, [sendSignalMessage]);
+
+  const downloadAllFiles = useCallback(() => {
+    downloadQueue.forEach((file) => {
+      if (!file.downloaded) {
+        downloadSingleFile(file);
+      }
+    });
+  }, [downloadQueue, downloadSingleFile]);
 
   // --- DRAG AND DROP HANDLERS ---
   const handleDragOver = (e: React.DragEvent) => {
@@ -1246,6 +1329,52 @@ export default function Home() {
   };
 
   const hasMissingSupabaseConfig = !process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+
+  const renderDownloadQueue = () => {
+    if (downloadQueue.length === 0) return null;
+    return (
+      <div className="mt-6 text-left border border-white/10 bg-white/[0.01] rounded-2xl p-4 w-full">
+        <div className="flex items-center justify-between mb-3 pb-2 border-b border-white/5">
+          <h4 className="text-xs sm:text-sm font-semibold text-neutral-200 flex items-center gap-2">
+            <Download className="w-4 h-4 text-indigo-400" />
+            Received Files Queue ({downloadQueue.length})
+          </h4>
+          {downloadQueue.some(f => !f.downloaded) && (
+            <button
+              onClick={downloadAllFiles}
+              className="text-[10px] sm:text-xs px-2.5 py-1 rounded bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30 font-medium transition-all cursor-pointer"
+            >
+              Download All
+            </button>
+          )}
+        </div>
+        <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+          {downloadQueue.map((qFile) => (
+            <div key={qFile.id} className="flex items-center justify-between p-2 rounded bg-white/[0.02] border border-white/5 text-xs">
+              <div className="flex items-center gap-2 min-w-0 flex-1 mr-2">
+                <File className="w-3.5 h-3.5 text-neutral-400 shrink-0" />
+                <div className="min-w-0 flex-1">
+                  <p className="font-medium text-neutral-200 truncate">{qFile.name}</p>
+                  <p className="text-[10px] text-neutral-500">{formatBytes(qFile.size)}</p>
+                </div>
+              </div>
+              <button
+                onClick={() => downloadSingleFile(qFile)}
+                className={`px-2.5 py-1 rounded text-[10px] sm:text-xs font-medium transition-all flex items-center gap-1 cursor-pointer ${
+                  qFile.downloaded
+                    ? 'bg-neutral-800 text-neutral-400 hover:bg-neutral-700'
+                    : 'bg-indigo-500 hover:bg-indigo-600 text-white shadow-sm'
+                }`}
+              >
+                <Download className="w-3 h-3" />
+                {qFile.downloaded ? 'Redownload' : 'Download'}
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
 
   if (!isClient) return null;
 
@@ -1576,6 +1705,7 @@ export default function Home() {
                     <p className="text-[11px] sm:text-xs text-neutral-400 mt-1.5 sm:mt-2 max-w-xs mx-auto leading-relaxed">
                       Connected to the sender. Waiting for them to choose and transmit a file...
                     </p>
+                    {renderDownloadQueue()}
                   </div>
                 )}
               </motion.div>
@@ -1659,21 +1789,43 @@ export default function Home() {
                 )}
 
                 {role === 'receiver' ? (
-                  <motion.button
-                    whileTap={{scale: 0.98}}
-                    onClick={downloadFile}
-                    id="btn-download"
-                    className="w-full mt-2 py-3.5 sm:py-3 px-4 rounded-xl bg-indigo-500 hover:bg-indigo-600 text-white font-medium text-sm flex items-center justify-center gap-2 shadow-lg shadow-indigo-500/20 transition-all cursor-pointer border border-indigo-400/20"
-                  >
-                    <Download className="w-4 h-4" />
-                    Download Received File
-                  </motion.button>
+                  <div className="flex flex-col gap-2.5 w-full mt-2">
+                    <motion.button
+                      whileTap={{scale: 0.98}}
+                      onClick={downloadFile}
+                      id="btn-download"
+                      className="w-full py-3.5 sm:py-3 px-4 rounded-xl bg-indigo-500 hover:bg-indigo-600 text-white font-medium text-sm flex items-center justify-center gap-2 shadow-lg shadow-indigo-500/20 transition-all cursor-pointer border border-indigo-400/20"
+                    >
+                      <Download className="w-4 h-4" />
+                      Download Received File
+                    </motion.button>
+
+                    <motion.button
+                      whileTap={{scale: 0.98}}
+                      onClick={() => setStatus('connected')}
+                      className="w-full py-2 px-4 rounded-xl bg-white/[0.04] hover:bg-white/[0.08] text-neutral-300 font-medium text-xs flex items-center justify-center gap-1 transition-all cursor-pointer border border-white/10"
+                    >
+                      Back to Queue / Waiting
+                    </motion.button>
+                  </div>
                 ) : (
-                  <div className="mt-4 text-neutral-400 text-xs flex items-center justify-center gap-2">
-                    <RefreshCw className="w-3.5 h-3.5 animate-spin text-neutral-500" />
-                    <span>Waiting for receiver to download...</span>
+                  <div className="mt-4 flex flex-col gap-3.5 items-center w-full">
+                    <div className="text-neutral-400 text-xs flex items-center justify-center gap-2">
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-neutral-500" />
+                      <span>Waiting for receiver to download...</span>
+                    </div>
+                    <motion.button
+                      whileTap={{scale: 0.98}}
+                      onClick={() => setStatus('connected')}
+                      className="w-full py-3 px-4 rounded-xl bg-indigo-500 hover:bg-indigo-600 text-white font-medium text-sm flex items-center justify-center gap-2 shadow-lg shadow-indigo-500/20 transition-all cursor-pointer border border-indigo-400/20"
+                    >
+                      <Plus className="w-4 h-4" />
+                      Send More Files
+                    </motion.button>
                   </div>
                 )}
+
+                {role === 'receiver' && renderDownloadQueue()}
               </motion.div>
             )}
           </AnimatePresence>
