@@ -44,7 +44,8 @@ import {
   Check,
   Camera,
   CameraOff,
-  Plus
+  Plus,
+  Instagram
 } from 'lucide-react';
 
 // Define transfer metrics state structure
@@ -1376,6 +1377,15 @@ export default function Home() {
     );
   };
 
+  const handleInstagramClick = useCallback(() => {
+    const url = "https://www.instagram.com/me_jagan?igsh=MWFuZG9kd2tjMTAwag==";
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.click();
+  }, []);
+
   if (!isClient) return null;
 
   return (
@@ -1383,6 +1393,34 @@ export default function Home() {
       {/* Decorative macOS blurred orb background lights */}
       <div className="absolute top-1/4 left-1/4 w-72 h-72 sm:w-96 sm:h-96 rounded-full bg-indigo-500/10 blur-[80px] sm:blur-[120px] pointer-events-none -translate-x-1/2 -translate-y-1/2" />
       <div className="absolute bottom-1/4 right-1/4 w-72 h-72 sm:w-96 sm:h-96 rounded-full bg-violet-500/10 blur-[80px] sm:blur-[120px] pointer-events-none translate-x-1/2 translate-y-1/2" />
+
+      {/* Instagram Profile Card (Top Priority) */}
+      <motion.div
+        initial={{ opacity: 0, y: -10 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.5, ease: [0.16, 1, 0.3, 1] }}
+        onClick={handleInstagramClick}
+        className="w-full max-w-[480px] glass-panel rounded-2xl border border-white/10 p-3 mb-4 flex items-center justify-between cursor-pointer hover:bg-white/[0.04] transition-all relative overflow-hidden group select-none z-30"
+      >
+        <div className="flex items-center gap-3">
+          {/* Left: Instagram icon inside gradient */}
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-amber-500 via-rose-500 to-violet-600 flex items-center justify-center text-white shadow-lg shadow-rose-500/20 group-hover:scale-105 transition-transform duration-300">
+            <Instagram className="w-5 h-5" />
+          </div>
+
+          {/* Center Text */}
+          <div className="flex flex-col text-left">
+            <span className="font-semibold text-xs sm:text-sm text-neutral-200">@me_jagan</span>
+            <span className="text-[10px] sm:text-xs text-neutral-400 group-hover:text-neutral-300 transition-colors">View my Instagram Profile</span>
+          </div>
+        </div>
+
+        {/* Right: Avatar Placeholder */}
+        <div className="w-9 h-9 rounded-full bg-neutral-800 border border-white/10 flex items-center justify-center overflow-hidden relative shadow-inner group-hover:border-white/20 transition-colors">
+          <div className="absolute inset-0 bg-gradient-to-b from-neutral-700 to-neutral-900 animate-pulse duration-[4000ms]" />
+          <span className="relative font-mono text-[10px] font-bold text-neutral-300">MJ</span>
+        </div>
+      </motion.div>
 
       {/* Main macOS window wrapper */}
       <motion.div
@@ -1405,20 +1443,32 @@ export default function Home() {
             <div className="w-3 h-3 rounded-full bg-green-500/20 border border-green-500/10" />
           </div>
 
-          {/* Dynamic TOP Connect Button */}
-          <motion.button
-            whileTap={{scale: 0.96}}
-            onClick={() => handleDisconnect(true, true)}
-            id="btn-connection"
-            className={`flex items-center gap-2 px-3 py-1.5 sm:px-4 sm:py-2 rounded-full font-mono text-[10px] sm:text-xs tracking-wide transition-all border shadow-sm ${
-              isConnected
-                ? 'bg-emerald-500/10 hover:bg-emerald-500/20 border-emerald-500/30 text-emerald-400'
-                : 'bg-red-500/10 hover:bg-red-500/20 border-red-500/30 text-red-400'
-            }`}
-          >
-            <span className={`w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full ${isConnected ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`} />
-            {isConnected ? 'CONNECTED' : 'DISCONNECTED'}
-          </motion.button>
+          {/* Dynamic TOP Connection Toggle Switch (macOS/iOS style) */}
+          <div className="flex items-center gap-2 sm:gap-3">
+            <span className={`font-mono text-[9px] sm:text-xs tracking-wider uppercase font-bold transition-colors ${
+              isConnected ? 'text-emerald-400' : 'text-red-400 font-medium'
+            }`}>
+              {isConnected ? 'Connected' : 'Disconnected'}
+            </span>
+            <button
+              onClick={() => handleDisconnect(true, true)}
+              id="btn-connection"
+              className={`relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none shadow-inner border border-white/10 cursor-pointer flex items-center ${
+                isConnected 
+                  ? 'bg-emerald-500' 
+                  : 'bg-red-500/20'
+              }`}
+              title={isConnected ? "Click to Disconnect" : "Disconnected"}
+            >
+              <motion.div
+                layout
+                transition={{ type: 'spring', stiffness: 500, damping: 30 }}
+                className={`w-4 h-4 rounded-full bg-white shadow-md absolute ${
+                  isConnected ? 'right-1' : 'left-1'
+                }`}
+              />
+            </button>
+          </div>
 
           {/* Clean minimal spacer for centering styling balance */}
           <div className="w-[52px]" />
@@ -1862,18 +1912,11 @@ export default function Home() {
 
           {status !== 'home' && (
             /* Sub-screen cancellation or metrics reset buttons */
-            <div className="flex justify-between items-center text-xs text-neutral-500">
-              <span className="flex items-center gap-1.5 py-1.5">
+            <div className="flex justify-center items-center text-xs text-neutral-500 py-2">
+              <span className="flex items-center gap-1.5">
                 <Shield className="w-3.5 h-3.5 text-neutral-600" />
                 Encrypted Connection
               </span>
-              <button
-                onClick={() => handleDisconnect(true, true)}
-                className="hover:text-neutral-300 transition-colors font-medium flex items-center gap-1 cursor-pointer py-2 px-1"
-              >
-                Disconnect & Reset
-                <ArrowRight className="w-3 h-3" />
-              </button>
             </div>
           )}
         </div>
