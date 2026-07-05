@@ -73,8 +73,6 @@ export default function Home() {
     'home' | 'sender-pairing' | 'receiver-pairing' | 'connecting' | 'connected' | 'transferring' | 'complete'
   >('home');
   const [isConnected, setIsConnected] = useState(false);
-  const [isStunActive, setIsStunActive] = useState(false);
-  const [isTurnActive, setIsTurnActive] = useState(false);
   const [role, setRoleState] = useState<'sender' | 'receiver' | null>(null);
   const roleRef = useRef<'sender' | 'receiver' | null>(null);
   const setRole = useCallback((newRole: 'sender' | 'receiver' | null) => {
@@ -115,7 +113,6 @@ export default function Home() {
   const receivedMetadataRef = useRef<{name: string; size: number; type: string} | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const joinRetryIntervalRef = useRef<any>(null);
-  const statsIntervalRef = useRef<any>(null);
   const handleSignalMessageRef = useRef<any>(null);
   const statusRef = useRef<string>('home');
   const roomCodeRef = useRef<string>('');
@@ -430,16 +427,9 @@ export default function Home() {
       'info'
     );
 
-    if (statsIntervalRef.current) {
-      clearInterval(statsIntervalRef.current);
-      statsIntervalRef.current = null;
-    }
-
     setSelectedFile(null);
     setStats(null);
     setIsConnected(false);
-    setIsStunActive(false);
-    setIsTurnActive(false);
     chunksReceivedRef.current = [];
     receivedBytesRef.current = 0;
     prevStatsTimeRef.current = 0;
@@ -451,9 +441,6 @@ export default function Home() {
     return () => {
       if (joinRetryIntervalRef.current) {
         clearInterval(joinRetryIntervalRef.current);
-      }
-      if (statsIntervalRef.current) {
-        clearInterval(statsIntervalRef.current);
       }
       if (fileReaderRef.current) {
         try { fileReaderRef.current.abort(); } catch (e) {}
@@ -479,104 +466,11 @@ export default function Home() {
 
   // --- PEER CONNECTION LISTENER HELPER ---
   const setupPeerConnectionListeners = useCallback((pc: RTCPeerConnection, side: 'sender' | 'receiver') => {
-    const checkStats = async () => {
-      if (pc.signalingState === 'closed' || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
-        if (statsIntervalRef.current) {
-          clearInterval(statsIntervalRef.current);
-          statsIntervalRef.current = null;
-        }
-        return;
-      }
-
-      try {
-        const stats = await pc.getStats();
-        let activeLocalType = '';
-
-        let activePairId = '';
-        let activePair: any = null;
-
-        stats.forEach((report) => {
-          if (report.type === 'transport' && report.selectedCandidatePairId) {
-            activePairId = report.selectedCandidatePairId;
-          }
-        });
-
-        if (activePairId) {
-          activePair = stats.get(activePairId);
-          if (!activePair) {
-            stats.forEach((report) => {
-              if (report.id === activePairId) {
-                activePair = report;
-              }
-            });
-          }
-        }
-
-        if (!activePair) {
-          // Fallback search
-          stats.forEach((report) => {
-            if (report.type === 'candidate-pair') {
-              if (report.selected === true || report.nominated === true) {
-                activePair = report;
-              }
-            }
-          });
-        }
-
-        if (activePair) {
-          const localCandId = activePair.localCandidateId;
-          if (localCandId) {
-            let localCand = stats.get(localCandId);
-            if (!localCand) {
-              stats.forEach((report) => {
-                if (report.id === localCandId) {
-                  localCand = report;
-                }
-              });
-            }
-            if (localCand && localCand.candidateType) {
-              activeLocalType = localCand.candidateType;
-            }
-          }
-        }
-
-        // Fallback: If no candidate-pair was resolved as active but we have local candidates,
-        // we can look at the local candidates directly or default to STUN if srflx is found
-        if (!activeLocalType) {
-          stats.forEach((report) => {
-            if (report.type === 'local-candidate') {
-              if (report.candidateType === 'relay') {
-                activeLocalType = 'relay';
-              } else if (report.candidateType === 'srflx' && activeLocalType !== 'relay') {
-                activeLocalType = 'srflx';
-              }
-            }
-          });
-        }
-
-        if (activeLocalType === 'srflx') {
-          setIsStunActive(true);
-          setIsTurnActive(false);
-        } else if (activeLocalType === 'relay') {
-          setIsStunActive(false);
-          setIsTurnActive(true);
-        }
-      } catch (e) {
-        // Silently fail to avoid console noise or interrupting flow
-      }
-    };
-
     pc.oniceconnectionstatechange = () => {
       addDebugLog(`[${side}] ICE connection state changed: ${pc.iceConnectionState}`, 
         pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed' ? 'success' :
         pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected' ? 'error' : 'info'
       );
-      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
-        checkStats();
-        if (!statsIntervalRef.current) {
-          statsIntervalRef.current = setInterval(checkStats, 2000);
-        }
-      }
     };
 
     pc.onconnectionstatechange = () => {
@@ -587,18 +481,10 @@ export default function Home() {
       if (pc.connectionState === 'connected') {
         setIsConnected(true);
         setStatus('connected');
-        checkStats();
-        if (!statsIntervalRef.current) {
-          statsIntervalRef.current = setInterval(checkStats, 2000);
-        }
       } else if (
         pc.connectionState === 'failed' ||
         pc.connectionState === 'closed'
       ) {
-        if (statsIntervalRef.current) {
-          clearInterval(statsIntervalRef.current);
-          statsIntervalRef.current = null;
-        }
         handleDisconnect(true, false);
       } else if (pc.connectionState === 'disconnected') {
         addDebugLog(`[${side}] Connection temporarily disconnected. Waiting to see if it recovers...`, 'warn');
@@ -607,14 +493,8 @@ export default function Home() {
 
     pc.onsignalingstatechange = () => {
       addDebugLog(`[${side}] Signaling state changed: ${pc.signalingState}`, 'info');
-      if (pc.signalingState === 'closed') {
-        if (statsIntervalRef.current) {
-          clearInterval(statsIntervalRef.current);
-          statsIntervalRef.current = null;
-        }
-      }
     };
-  }, [addDebugLog, handleDisconnect, setIsStunActive, setIsTurnActive]);
+  }, [addDebugLog, handleDisconnect]);
 
   // --- RECEIVER DATA CHANNEL SETUP ---
   const setupReceiverDataChannel = useCallback((dc: RTCDataChannel) => {
@@ -2185,25 +2065,7 @@ export default function Home() {
         </div>
       </motion.div>
 
-      {/* Network Status Indicators */}
-      <div className="flex justify-center items-center gap-4 my-2 z-20 select-none">
-        <div className="flex items-center gap-1.5 text-[10px] font-mono tracking-wider text-neutral-400">
-          <div className={`w-2.5 h-2.5 rounded transition-all duration-300 ${
-            isStunActive 
-              ? 'bg-emerald-500 border border-emerald-400 shadow-md shadow-emerald-500/30' 
-              : 'bg-neutral-800 border border-white/5'
-          }`} />
-          <span>STUN</span>
-        </div>
-        <div className="flex items-center gap-1.5 text-[10px] font-mono tracking-wider text-neutral-400">
-          <div className={`w-2.5 h-2.5 rounded transition-all duration-300 ${
-            isTurnActive 
-              ? 'bg-emerald-500 border border-emerald-400 shadow-md shadow-emerald-500/30' 
-              : 'bg-neutral-800 border border-white/5'
-          }`} />
-          <span>TURN</span>
-        </div>
-      </div>
+
 
       {/* Live System Log Console */}
       <motion.div
