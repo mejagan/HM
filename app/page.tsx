@@ -563,7 +563,7 @@ export default function Home() {
           const now = Date.now();
           const isComplete = receivedBytes >= meta.size;
 
-          if (isComplete || now - prevStatsTimeRef.current > 150) {
+          if (isComplete || now - prevStatsTimeRef.current > 300) {
             prevStatsTimeRef.current = now;
 
             setStats((prev) => {
@@ -1161,10 +1161,10 @@ export default function Home() {
     });
 
     // Dynamic chunk size selection based on file size for optimal overhead vs compatibility
-    const CHUNK_SIZE = totalSize > 50 * 1024 * 1024 
-      ? 262144  // 256KB for files > 50MB
-      : totalSize > 5 * 1024 * 1024 
-        ? 131072 // 128KB for files > 5MB
+    const CHUNK_SIZE = totalSize > 20 * 1024 * 1024 
+      ? 262144  // 256KB for files > 20MB
+      : totalSize > 2 * 1024 * 1024 
+        ? 131072 // 128KB for files > 2MB
         : 65536; // 64KB for small files
 
     const HIGH_WATERMARK = Math.max(4194304, CHUNK_SIZE * 32); // 4MB - 8MB high watermark
@@ -1199,13 +1199,14 @@ export default function Home() {
               }
 
               const sliceSize = Math.min(CHUNK_SIZE, totalSize - offset);
-              const chunk = entireBuffer.slice(offset, offset + sliceSize);
+              // Zero-copy view construction over the pre-loaded ArrayBuffer avoids any memory copies/allocations
+              const chunk = new Uint8Array(entireBuffer, offset, sliceSize);
               dc.send(chunk);
               offset += sliceSize;
 
-              // Throttled stats update (every 250ms to keep CPU free for transfer)
+              // Throttled stats update (every 300ms to keep CPU free for transfer)
               const now = Date.now();
-              if (now - lastStatsUpdateTime > 250 || offset >= totalSize) {
+              if (now - lastStatsUpdateTime > 300 || offset >= totalSize) {
                 lastStatsUpdateTime = now;
                 const elapsed = (now - startTime) / 1000 || 0.001;
                 const speed = offset / elapsed;
@@ -1253,67 +1254,92 @@ export default function Home() {
       return;
     }
 
-    // SPEED OPTIMIZATION 2: Pipelined parallel-reading sliding window for files > 100MB.
-    // Keeps up to 4 concurrent asynchronous slice.arrayBuffer() reads pending in flight, 
-    // caching them in a Map to preserve sequential order and avoid thread-blocking.
-    const MAX_CONCURRENT_READS = 4;
-    const MAX_PRELOAD_CHUNKS = 40; // ~10MB buffer maximum
+    // SPEED OPTIMIZATION 2: Block-Based sliding window pipeline for files > 100MB.
+    // Instead of reading thousands of small slices asynchronously (causing excessive Promise, GC & I/O overhead),
+    // we read the file in large 8MB blocks asynchronously, then slice chunks from each block completely synchronously.
+    const BLOCK_SIZE = 8 * 1024 * 1024; // 8MB block sizes
+    const MAX_PRELOAD_BLOCKS = 3; // Keep up to 24MB maximum preloaded in RAM (safely bounded)
     
-    let nextReadOffset = 0;
-    const loadedChunks = new Map<number, ArrayBuffer>();
-    let activeReads = 0;
+    const loadedBlocks = new Map<number, ArrayBuffer>();
+    const activeBlockReads = new Set<number>();
 
-    const preloadAndSend = () => {
+    const preloadBlocks = () => {
       if (dc.readyState !== 'open') return;
 
-      // 1. Maintain concurrent async reads
-      while (
-        activeReads < MAX_CONCURRENT_READS && 
-        nextReadOffset < totalSize && 
-        loadedChunks.size < MAX_PRELOAD_CHUNKS
-      ) {
-        const currentReadOffset = nextReadOffset;
-        const sliceSize = Math.min(CHUNK_SIZE, totalSize - currentReadOffset);
-        nextReadOffset += sliceSize;
-        activeReads++;
+      const currentBlockIndex = Math.floor(offset / BLOCK_SIZE);
+      const maxBlockIndex = Math.ceil(totalSize / BLOCK_SIZE) - 1;
 
-        const slice = file.slice(currentReadOffset, currentReadOffset + sliceSize);
+      while (
+        activeBlockReads.size < 2 && // Up to 2 concurrent disk reads to serialize flash memory access
+        loadedBlocks.size < MAX_PRELOAD_BLOCKS
+      ) {
+        let targetBlock = -1;
+        for (let i = currentBlockIndex; i <= maxBlockIndex; i++) {
+          if (!loadedBlocks.has(i) && !activeBlockReads.has(i)) {
+            targetBlock = i;
+            break;
+          }
+        }
+        if (targetBlock === -1) break;
+
+        activeBlockReads.add(targetBlock);
+        const blockToLoad = targetBlock;
+
+        const blockStart = blockToLoad * BLOCK_SIZE;
+        const actualBlockSize = Math.min(BLOCK_SIZE, totalSize - blockStart);
+        const slice = file.slice(blockStart, blockStart + actualBlockSize);
+
         slice.arrayBuffer()
           .then((buffer) => {
-            activeReads--;
-            loadedChunks.set(currentReadOffset, buffer);
-            preloadAndSend();
+            activeBlockReads.delete(blockToLoad);
+            loadedBlocks.set(blockToLoad, buffer);
+            preloadBlocks();
+            sendFromBlocks();
           })
           .catch((err) => {
-            console.error('Error preloading chunk:', err);
-            activeReads--;
+            console.error('Error preloading file block:', err);
+            activeBlockReads.delete(blockToLoad);
             setError('Error reading file. Please try again.');
             handleDisconnect(true, false);
           });
       }
+    };
 
-      // 2. Transmit available sequential chunks
-      if (isSending) return;
+    const sendFromBlocks = () => {
+      if (dc.readyState !== 'open' || isSending) return;
       isSending = true;
 
       try {
         while (offset < totalSize) {
           if (dc.bufferedAmount >= HIGH_WATERMARK) {
-            return; // Wait for bufferedamountlow
+            return; // Wait for bufferedamountlow event
           }
 
-          const buffer = loadedChunks.get(offset);
-          if (!buffer) {
-            return; // Next sequential chunk is still being read. Wait.
+          const currentBlockIndex = Math.floor(offset / BLOCK_SIZE);
+          const blockBuffer = loadedBlocks.get(currentBlockIndex);
+
+          if (!blockBuffer) {
+            preloadBlocks(); // Trigger preloading for upcoming blocks
+            return; // Wait for the next sequential block to be loaded
           }
 
-          dc.send(buffer);
-          loadedChunks.delete(offset);
-          offset += buffer.byteLength;
+          const blockStart = currentBlockIndex * BLOCK_SIZE;
+          const offsetInBlock = offset - blockStart;
+          const sliceSize = Math.min(CHUNK_SIZE, totalSize - offset);
 
-          // Throttled stats update (every 250ms to keep CPU free for transfer)
+          // Zero-copy view construction over the pre-loaded Block Buffer
+          const chunk = new Uint8Array(blockBuffer, offsetInBlock, sliceSize);
+          dc.send(chunk);
+          offset += sliceSize;
+
+          // Free up memory immediately once the entire block is fully consumed
+          if (offsetInBlock + sliceSize >= blockBuffer.byteLength) {
+            loadedBlocks.delete(currentBlockIndex);
+          }
+
+          // Throttled stats update (every 300ms to keep CPU free for transfer)
           const now = Date.now();
-          if (now - lastStatsUpdateTime > 250 || offset >= totalSize) {
+          if (now - lastStatsUpdateTime > 300 || offset >= totalSize) {
             lastStatsUpdateTime = now;
             const elapsed = (now - startTime) / 1000 || 0.001;
             const speed = offset / elapsed;
@@ -1329,9 +1355,9 @@ export default function Home() {
               speed,
               remainingTime,
               startTime,
-            });
-          }
-        }
+                });
+              }
+            }
 
         if (offset >= totalSize) {
           dc.removeEventListener('bufferedamountlow', handleBufferedAmountLow);
@@ -1347,12 +1373,15 @@ export default function Home() {
     };
 
     const handleBufferedAmountLow = () => {
-      preloadAndSend();
+      if (totalSize <= 100 * 1024 * 1024) return; // Managed by optimization 1
+      preloadBlocks();
+      sendFromBlocks();
     };
     dc.addEventListener('bufferedamountlow', handleBufferedAmountLow);
 
     // Bootstrap preloading and transmission
-    preloadAndSend();
+    preloadBlocks();
+    sendFromBlocks();
   };
 
   // --- RECEIVER: DOWNLOAD FILE ENGINE ---
