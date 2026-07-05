@@ -73,6 +73,8 @@ export default function Home() {
     'home' | 'sender-pairing' | 'receiver-pairing' | 'connecting' | 'connected' | 'transferring' | 'complete'
   >('home');
   const [isConnected, setIsConnected] = useState(false);
+  const [isStunActive, setIsStunActive] = useState(false);
+  const [isTurnActive, setIsTurnActive] = useState(false);
   const [role, setRoleState] = useState<'sender' | 'receiver' | null>(null);
   const roleRef = useRef<'sender' | 'receiver' | null>(null);
   const setRole = useCallback((newRole: 'sender' | 'receiver' | null) => {
@@ -108,6 +110,8 @@ export default function Home() {
   const dataChannelRef = useRef<RTCDataChannel | null>(null);
   const fileReaderRef = useRef<FileReader | null>(null);
   const chunksReceivedRef = useRef<ArrayBuffer[]>([]);
+  const receivedBytesRef = useRef<number>(0);
+  const prevStatsTimeRef = useRef<number>(0);
   const receivedMetadataRef = useRef<{name: string; size: number; type: string} | null>(null);
   const pendingCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const joinRetryIntervalRef = useRef<any>(null);
@@ -428,7 +432,11 @@ export default function Home() {
     setSelectedFile(null);
     setStats(null);
     setIsConnected(false);
+    setIsStunActive(false);
+    setIsTurnActive(false);
     chunksReceivedRef.current = [];
+    receivedBytesRef.current = 0;
+    prevStatsTimeRef.current = 0;
     receivedMetadataRef.current = null;
   }, [addDebugLog, setRole, setDownloadQueue, sendSignalMessage]);
 
@@ -462,11 +470,87 @@ export default function Home() {
 
   // --- PEER CONNECTION LISTENER HELPER ---
   const setupPeerConnectionListeners = useCallback((pc: RTCPeerConnection, side: 'sender' | 'receiver') => {
+    let statsInterval: any = null;
+
+    const checkStats = async () => {
+      if (pc.signalingState === 'closed' || pc.connectionState === 'closed' || pc.connectionState === 'failed') {
+        if (statsInterval) {
+          clearInterval(statsInterval);
+          statsInterval = null;
+        }
+        return;
+      }
+
+      try {
+        const stats = await pc.getStats();
+        let activeLocalType = '';
+
+        // Find the active candidate pair
+        let activePair: any = null;
+        stats.forEach((report) => {
+          if (report.type === 'candidate-pair') {
+            if (report.nominated === true || report.state === 'succeeded' || report.currentRoundTripTime !== undefined) {
+              if (!activePair || report.nominated || report.state === 'succeeded') {
+                activePair = report;
+              }
+            }
+          }
+        });
+
+        if (activePair) {
+          const localCandId = activePair.localCandidateId;
+          if (localCandId) {
+            const localCand = stats.get(localCandId);
+            if (localCand && localCand.candidateType) {
+              activeLocalType = localCand.candidateType;
+            } else {
+              // Alternative lookup
+              stats.forEach((report) => {
+                if (report.id === localCandId && report.candidateType) {
+                  activeLocalType = report.candidateType;
+                }
+              });
+            }
+          }
+        }
+
+        // Fallback: If no candidate-pair was resolved as active but we have local candidates,
+        // we can look at the local candidates directly or default to STUN if srflx is found
+        if (!activeLocalType) {
+          stats.forEach((report) => {
+            if (report.type === 'local-candidate') {
+              if (report.candidateType === 'relay') {
+                activeLocalType = 'relay';
+              } else if (report.candidateType === 'srflx' && activeLocalType !== 'relay') {
+                activeLocalType = 'srflx';
+              }
+            }
+          });
+        }
+
+        if (activeLocalType === 'srflx') {
+          setIsStunActive(true);
+          setIsTurnActive(false);
+        } else if (activeLocalType === 'relay') {
+          setIsStunActive(false);
+          setIsTurnActive(true);
+        }
+      } catch (e) {
+        // Silently fail to avoid console noise or interrupting flow
+      }
+    };
+
     pc.oniceconnectionstatechange = () => {
       addDebugLog(`[${side}] ICE connection state changed: ${pc.iceConnectionState}`, 
         pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed' ? 'success' :
         pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected' ? 'error' : 'info'
       );
+      if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        checkStats();
+        if (!statsInterval) {
+          statsInterval = setInterval(checkStats, 2000);
+        }
+      }
     };
 
     pc.onconnectionstatechange = () => {
@@ -477,10 +561,18 @@ export default function Home() {
       if (pc.connectionState === 'connected') {
         setIsConnected(true);
         setStatus('connected');
+        checkStats();
+        if (!statsInterval) {
+          statsInterval = setInterval(checkStats, 2000);
+        }
       } else if (
         pc.connectionState === 'failed' ||
         pc.connectionState === 'closed'
       ) {
+        if (statsInterval) {
+          clearInterval(statsInterval);
+          statsInterval = null;
+        }
         handleDisconnect(true, false);
       } else if (pc.connectionState === 'disconnected') {
         addDebugLog(`[${side}] Connection temporarily disconnected. Waiting to see if it recovers...`, 'warn');
@@ -489,8 +581,14 @@ export default function Home() {
 
     pc.onsignalingstatechange = () => {
       addDebugLog(`[${side}] Signaling state changed: ${pc.signalingState}`, 'info');
+      if (pc.signalingState === 'closed') {
+        if (statsInterval) {
+          clearInterval(statsInterval);
+          statsInterval = null;
+        }
+      }
     };
-  }, [addDebugLog, handleDisconnect]);
+  }, [addDebugLog, handleDisconnect, setIsStunActive, setIsTurnActive]);
 
   // --- RECEIVER DATA CHANNEL SETUP ---
   const setupReceiverDataChannel = useCallback((dc: RTCDataChannel) => {
@@ -525,6 +623,8 @@ export default function Home() {
               type: msg.mimeType,
             };
             chunksReceivedRef.current = [];
+            receivedBytesRef.current = 0;
+            prevStatsTimeRef.current = 0;
 
             setStats({
               fileName: msg.name,
@@ -549,29 +649,36 @@ export default function Home() {
         // Binary Chunk (ArrayBuffer)
         const chunk = event.data as ArrayBuffer;
         chunksReceivedRef.current.push(chunk);
+        receivedBytesRef.current += chunk.byteLength;
+        const receivedBytes = receivedBytesRef.current;
 
         const meta = receivedMetadataRef.current;
         if (meta) {
-          const receivedBytes = chunksReceivedRef.current.reduce((acc, curr) => acc + curr.byteLength, 0);
+          const now = Date.now();
+          const isComplete = receivedBytes >= meta.size;
 
-          setStats((prev) => {
-            if (!prev) return null;
-            const elapsed = (Date.now() - prev.startTime) / 1000 || 0.001;
-            const speed = receivedBytes / elapsed;
-            const progress = Math.min((receivedBytes / meta.size) * 100, 100);
-            const remainingBytes = meta.size - receivedBytes;
-            const remainingTime = speed > 0 ? remainingBytes / speed : 0;
+          if (isComplete || now - prevStatsTimeRef.current > 150) {
+            prevStatsTimeRef.current = now;
 
-            return {
-              ...prev,
-              progress,
-              transferredBytes: receivedBytes,
-              speed,
-              remainingTime,
-            };
-          });
+            setStats((prev) => {
+              if (!prev) return null;
+              const elapsed = (now - prev.startTime) / 1000 || 0.001;
+              const speed = receivedBytes / elapsed;
+              const progress = Math.min((receivedBytes / meta.size) * 100, 100);
+              const remainingBytes = meta.size - receivedBytes;
+              const remainingTime = speed > 0 ? remainingBytes / speed : 0;
 
-          if (receivedBytes >= meta.size) {
+              return {
+                ...prev,
+                progress,
+                transferredBytes: receivedBytes,
+                speed,
+                remainingTime,
+              };
+            });
+          }
+
+          if (isComplete) {
             addDebugLog('All file chunks received completely!', 'success');
 
             const newFileId = Math.random().toString(36).substring(2, 9);
@@ -1147,69 +1254,123 @@ export default function Home() {
       startTime: Date.now(),
     });
 
-    const CHUNK_SIZE = 16384; // Safe WebRTC MTU chunk size: 16KB
+    const CHUNK_SIZE = 131072; // Optimized WebRTC chunk size: 128KB (highly efficient & safe for modern data channels)
+    const HIGH_WATERMARK = 1048576 * 4; // 4MB high watermark
+    const LOW_WATERMARK = 1048576 * 1;  // 1MB low watermark (threshold)
     let offset = 0;
     const startTime = Date.now();
+    let lastStatsUpdateTime = 0;
 
-    const reader = new FileReader();
-    fileReaderRef.current = reader;
+    // Configure the low threshold watermark on the channel
+    try {
+      dc.bufferedAmountLowThreshold = LOW_WATERMARK;
+    } catch (e) {
+      console.warn('Could not set bufferedAmountLowThreshold:', e);
+    }
 
-    const readNextChunk = () => {
-      if (dc.readyState !== 'open') {
-        console.warn('Data channel closed unexpectedly during write');
+    const preloadedChunks: ArrayBuffer[] = [];
+    const preloadLimit = 16; // Maintain 16 chunks preloaded (~2MB memory)
+    let isReading = false;
+    let isSending = false;
+
+    const preloadNext = () => {
+      if (dc.readyState !== 'open' || offset >= totalSize) {
         return;
       }
-      const slice = file.slice(offset, offset + CHUNK_SIZE);
-      reader.readAsArrayBuffer(slice);
+
+      const currentReadOffset = offset + (preloadedChunks.length * CHUNK_SIZE);
+      if (currentReadOffset >= totalSize || preloadedChunks.length >= preloadLimit || isReading) {
+        return;
+      }
+
+      isReading = true;
+      const sliceSize = Math.min(CHUNK_SIZE, totalSize - currentReadOffset);
+      const slice = file.slice(currentReadOffset, currentReadOffset + sliceSize);
+
+      slice.arrayBuffer()
+        .then((buffer) => {
+          if (dc.readyState !== 'open') return;
+          preloadedChunks.push(buffer);
+          isReading = false;
+          // Recursively preload more up to the limit
+          preloadNext();
+          // Trigger transmission
+          sendPending();
+        })
+        .catch((err) => {
+          console.error('Error in slice.arrayBuffer preloading:', err);
+          isReading = false;
+        });
     };
 
-    reader.onload = (event) => {
-      if (!event.target || !event.target.result) return;
-      const buffer = event.target.result as ArrayBuffer;
+    const sendPending = () => {
+      if (isSending || dc.readyState !== 'open') return;
+      isSending = true;
 
       try {
-        dc.send(buffer);
-        offset += buffer.byteLength;
-
-        const elapsed = (Date.now() - startTime) / 1000 || 0.001;
-        const speed = offset / elapsed;
-        const progress = Math.min((offset / totalSize) * 100, 100);
-        const remainingBytes = totalSize - offset;
-        const remainingTime = speed > 0 ? remainingBytes / speed : 0;
-
-        setStats({
-          fileName: name,
-          fileSize: totalSize,
-          progress,
-          transferredBytes: offset,
-          speed,
-          remainingTime,
-          startTime,
-        });
-
-        if (offset < totalSize) {
-          // WebRTC Backpressure / Flow Control: avoid overwhelming browser transport buffers
-          if (dc.bufferedAmount > 1048576) { // 1MB high watermark
-            const handleBufferedAmountLow = () => {
-              dc.removeEventListener('bufferedamountlow', handleBufferedAmountLow);
-              readNextChunk();
-            };
-            dc.addEventListener('bufferedamountlow', handleBufferedAmountLow);
-          } else {
-            setTimeout(readNextChunk, 0); // Keep event loop fluid
+        while (offset < totalSize) {
+          if (dc.bufferedAmount >= HIGH_WATERMARK) {
+            // Wait for bufferedamountlow event to resume sending
+            isSending = false;
+            return;
           }
-        } else {
-          // Send complete, set state
+
+          if (preloadedChunks.length === 0) {
+            // Buffer dry - preloader needs to catch up
+            preloadNext();
+            isSending = false;
+            return;
+          }
+
+          const buffer = preloadedChunks.shift()!;
+          dc.send(buffer);
+          offset += buffer.byteLength;
+
+          // Prime preloading to replace the consumed chunk
+          preloadNext();
+
+          // Throttle progress updates to once every 150ms to keep CPU clear for transfer
+          const now = Date.now();
+          if (now - lastStatsUpdateTime > 150 || offset >= totalSize) {
+            lastStatsUpdateTime = now;
+            const elapsed = (now - startTime) / 1000 || 0.001;
+            const speed = offset / elapsed;
+            const progress = Math.min((offset / totalSize) * 100, 100);
+            const remainingBytes = totalSize - offset;
+            const remainingTime = speed > 0 ? remainingBytes / speed : 0;
+
+            setStats({
+              fileName: name,
+              fileSize: totalSize,
+              progress,
+              transferredBytes: offset,
+              speed,
+              remainingTime,
+              startTime,
+            });
+          }
+        }
+
+        if (offset >= totalSize) {
+          dc.removeEventListener('bufferedamountlow', handleBufferedAmountLow);
           setStatus('complete');
         }
       } catch (e) {
         console.error('Error writing chunk to RTCDataChannel:', e);
         setError('Transmission disrupted. Let’s try reconnecting.');
         handleDisconnect(true, false);
+      } finally {
+        isSending = false;
       }
     };
 
-    readNextChunk();
+    const handleBufferedAmountLow = () => {
+      sendPending();
+    };
+    dc.addEventListener('bufferedamountlow', handleBufferedAmountLow);
+
+    // Bootstrap preloading and transmission
+    preloadNext();
   };
 
   // --- RECEIVER: DOWNLOAD FILE ENGINE ---
@@ -1921,6 +2082,26 @@ export default function Home() {
           )}
         </div>
       </motion.div>
+
+      {/* Network Status Indicators */}
+      <div className="flex justify-center items-center gap-4 my-2 z-20 select-none">
+        <div className="flex items-center gap-1.5 text-[10px] font-mono tracking-wider text-neutral-400">
+          <div className={`w-2.5 h-2.5 rounded transition-all duration-300 ${
+            isStunActive 
+              ? 'bg-emerald-500 border border-emerald-400 shadow-md shadow-emerald-500/30' 
+              : 'bg-neutral-800 border border-white/5'
+          }`} />
+          <span>STUN</span>
+        </div>
+        <div className="flex items-center gap-1.5 text-[10px] font-mono tracking-wider text-neutral-400">
+          <div className={`w-2.5 h-2.5 rounded transition-all duration-300 ${
+            isTurnActive 
+              ? 'bg-emerald-500 border border-emerald-400 shadow-md shadow-emerald-500/30' 
+              : 'bg-neutral-800 border border-white/5'
+          }`} />
+          <span>TURN</span>
+        </div>
+      </div>
 
       {/* Live System Log Console */}
       <motion.div
