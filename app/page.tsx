@@ -1254,12 +1254,20 @@ export default function Home() {
       startTime: Date.now(),
     });
 
-    const CHUNK_SIZE = 131072; // Optimized WebRTC chunk size: 128KB (highly efficient & safe for modern data channels)
-    const HIGH_WATERMARK = 1048576 * 4; // 4MB high watermark
-    const LOW_WATERMARK = 1048576 * 1;  // 1MB low watermark (threshold)
+    // Dynamic chunk size selection based on file size for optimal overhead vs compatibility
+    const CHUNK_SIZE = totalSize > 50 * 1024 * 1024 
+      ? 262144  // 256KB for files > 50MB
+      : totalSize > 5 * 1024 * 1024 
+        ? 131072 // 128KB for files > 5MB
+        : 65536; // 64KB for small files
+
+    const HIGH_WATERMARK = Math.max(4194304, CHUNK_SIZE * 32); // 4MB - 8MB high watermark
+    const LOW_WATERMARK = Math.max(1048576, CHUNK_SIZE * 8);  // 1MB - 2MB low watermark threshold
+    
     let offset = 0;
     const startTime = Date.now();
     let lastStatsUpdateTime = 0;
+    let isSending = false;
 
     // Configure the low threshold watermark on the channel
     try {
@@ -1268,70 +1276,138 @@ export default function Home() {
       console.warn('Could not set bufferedAmountLowThreshold:', e);
     }
 
-    const preloadedChunks: ArrayBuffer[] = [];
-    const preloadLimit = 16; // Maintain 16 chunks preloaded (~2MB memory)
-    let isReading = false;
-    let isSending = false;
+    // SPEED OPTIMIZATION 1: If file is <= 100MB, pre-read the entire file into memory as a single ArrayBuffer.
+    // This bypasses asynchronous file slice reading overhead completely during network transmission.
+    if (totalSize <= 100 * 1024 * 1024) {
+      file.arrayBuffer().then((entireBuffer) => {
+        if (dc.readyState !== 'open') return;
 
-    const preloadNext = () => {
-      if (dc.readyState !== 'open' || offset >= totalSize) {
-        return;
+        const sendFromBuffer = () => {
+          if (dc.readyState !== 'open' || isSending) return;
+          isSending = true;
+
+          try {
+            while (offset < totalSize) {
+              if (dc.bufferedAmount >= HIGH_WATERMARK) {
+                return; // Backpressure triggered, wait for bufferedamountlow
+              }
+
+              const sliceSize = Math.min(CHUNK_SIZE, totalSize - offset);
+              const chunk = entireBuffer.slice(offset, offset + sliceSize);
+              dc.send(chunk);
+              offset += sliceSize;
+
+              // Throttled stats update (every 250ms to keep CPU free for transfer)
+              const now = Date.now();
+              if (now - lastStatsUpdateTime > 250 || offset >= totalSize) {
+                lastStatsUpdateTime = now;
+                const elapsed = (now - startTime) / 1000 || 0.001;
+                const speed = offset / elapsed;
+                const progress = Math.min((offset / totalSize) * 100, 100);
+                const remainingBytes = totalSize - offset;
+                const remainingTime = speed > 0 ? remainingBytes / speed : 0;
+
+                setStats({
+                  fileName: name,
+                  fileSize: totalSize,
+                  progress,
+                  transferredBytes: offset,
+                  speed,
+                  remainingTime,
+                  startTime,
+                });
+              }
+            }
+
+            if (offset >= totalSize) {
+              dc.removeEventListener('bufferedamountlow', handleBufferedAmountLow);
+              setStatus('complete');
+            }
+          } catch (e) {
+            console.error('Error writing chunk to RTCDataChannel:', e);
+            setError('Transmission disrupted. Let’s try reconnecting.');
+            handleDisconnect(true, false);
+          } finally {
+            isSending = false;
+          }
+        };
+
+        const handleBufferedAmountLow = () => {
+          sendFromBuffer();
+        };
+        dc.addEventListener('bufferedamountlow', handleBufferedAmountLow);
+
+        // Start sending
+        sendFromBuffer();
+      }).catch((err) => {
+        console.error('Error reading entire file buffer:', err);
+        setError('Failed to read file.');
+        handleDisconnect(true, false);
+      });
+      return;
+    }
+
+    // SPEED OPTIMIZATION 2: Pipelined parallel-reading sliding window for files > 100MB.
+    // Keeps up to 4 concurrent asynchronous slice.arrayBuffer() reads pending in flight, 
+    // caching them in a Map to preserve sequential order and avoid thread-blocking.
+    const MAX_CONCURRENT_READS = 4;
+    const MAX_PRELOAD_CHUNKS = 40; // ~10MB buffer maximum
+    
+    let nextReadOffset = 0;
+    const loadedChunks = new Map<number, ArrayBuffer>();
+    let activeReads = 0;
+
+    const preloadAndSend = () => {
+      if (dc.readyState !== 'open') return;
+
+      // 1. Maintain concurrent async reads
+      while (
+        activeReads < MAX_CONCURRENT_READS && 
+        nextReadOffset < totalSize && 
+        loadedChunks.size < MAX_PRELOAD_CHUNKS
+      ) {
+        const currentReadOffset = nextReadOffset;
+        const sliceSize = Math.min(CHUNK_SIZE, totalSize - currentReadOffset);
+        nextReadOffset += sliceSize;
+        activeReads++;
+
+        const slice = file.slice(currentReadOffset, currentReadOffset + sliceSize);
+        slice.arrayBuffer()
+          .then((buffer) => {
+            activeReads--;
+            loadedChunks.set(currentReadOffset, buffer);
+            preloadAndSend();
+          })
+          .catch((err) => {
+            console.error('Error preloading chunk:', err);
+            activeReads--;
+            setError('Error reading file. Please try again.');
+            handleDisconnect(true, false);
+          });
       }
 
-      const currentReadOffset = offset + (preloadedChunks.length * CHUNK_SIZE);
-      if (currentReadOffset >= totalSize || preloadedChunks.length >= preloadLimit || isReading) {
-        return;
-      }
-
-      isReading = true;
-      const sliceSize = Math.min(CHUNK_SIZE, totalSize - currentReadOffset);
-      const slice = file.slice(currentReadOffset, currentReadOffset + sliceSize);
-
-      slice.arrayBuffer()
-        .then((buffer) => {
-          if (dc.readyState !== 'open') return;
-          preloadedChunks.push(buffer);
-          isReading = false;
-          // Recursively preload more up to the limit
-          preloadNext();
-          // Trigger transmission
-          sendPending();
-        })
-        .catch((err) => {
-          console.error('Error in slice.arrayBuffer preloading:', err);
-          isReading = false;
-        });
-    };
-
-    const sendPending = () => {
-      if (isSending || dc.readyState !== 'open') return;
+      // 2. Transmit available sequential chunks
+      if (isSending) return;
       isSending = true;
 
       try {
         while (offset < totalSize) {
           if (dc.bufferedAmount >= HIGH_WATERMARK) {
-            // Wait for bufferedamountlow event to resume sending
-            isSending = false;
-            return;
+            return; // Wait for bufferedamountlow
           }
 
-          if (preloadedChunks.length === 0) {
-            // Buffer dry - preloader needs to catch up
-            preloadNext();
-            isSending = false;
-            return;
+          const buffer = loadedChunks.get(offset);
+          if (!buffer) {
+            return; // Next sequential chunk is still being read. Wait.
           }
 
-          const buffer = preloadedChunks.shift()!;
           dc.send(buffer);
+          loadedChunks.delete(offset);
           offset += buffer.byteLength;
 
-          // Prime preloading to replace the consumed chunk
-          preloadNext();
-
-          // Throttle progress updates to once every 150ms to keep CPU clear for transfer
+          // Throttled stats update (every 250ms to keep CPU free for transfer)
           const now = Date.now();
-          if (now - lastStatsUpdateTime > 150 || offset >= totalSize) {
+          if (now - lastStatsUpdateTime > 250 || offset >= totalSize) {
             lastStatsUpdateTime = now;
             const elapsed = (now - startTime) / 1000 || 0.001;
             const speed = offset / elapsed;
@@ -1365,12 +1441,12 @@ export default function Home() {
     };
 
     const handleBufferedAmountLow = () => {
-      sendPending();
+      preloadAndSend();
     };
     dc.addEventListener('bufferedamountlow', handleBufferedAmountLow);
 
     // Bootstrap preloading and transmission
-    preloadNext();
+    preloadAndSend();
   };
 
   // --- RECEIVER: DOWNLOAD FILE ENGINE ---
