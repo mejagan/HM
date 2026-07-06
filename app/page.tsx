@@ -98,6 +98,7 @@ export default function Home() {
     chunks: ArrayBuffer[];
     downloaded: boolean;
     receivedBytes: number;
+    blobUrl?: string;
   }[]>([]);
 
   // --- REFS ---
@@ -121,6 +122,83 @@ export default function Home() {
   const outgoingSignalingQueueRef = useRef<any[]>([]);
   const incomingSignalingQueueRef = useRef<any[]>([]);
   const subscriptionRetryTimeoutRef = useRef<any>(null);
+  const senderWorkersRef = useRef<Worker[]>([]);
+  const blockCallbacksRef = useRef<Map<number, (buffer: ArrayBuffer) => void>>(new Map());
+  const receiverWorkerRef = useRef<Worker | null>(null);
+
+  const getSenderWorkerPool = useCallback(() => {
+    if (senderWorkersRef.current.length === 0) {
+      const workerBlob = new Blob([`
+        self.onmessage = function(e) {
+          const { file, blockStart, actualBlockSize, blockIndex } = e.data;
+          try {
+            const slice = file.slice(blockStart, blockStart + actualBlockSize);
+            const reader = new FileReaderSync();
+            const buffer = reader.readAsArrayBuffer(slice);
+            self.postMessage({ blockIndex, buffer }, [buffer]);
+          } catch (err) {
+            self.postMessage({ blockIndex, error: err ? err.toString() : 'Unknown error' });
+          }
+        };
+      `], { type: 'application/javascript' });
+      const workerUrl = URL.createObjectURL(workerBlob);
+      const concurrency = Math.min(4, typeof navigator !== 'undefined' ? (navigator.hardwareConcurrency || 4) : 4);
+      
+      for (let i = 0; i < concurrency; i++) {
+        const w = new Worker(workerUrl);
+        w.onmessage = (e) => {
+          const { blockIndex, buffer, error } = e.data;
+          const callback = blockCallbacksRef.current.get(blockIndex);
+          if (callback) {
+            blockCallbacksRef.current.delete(blockIndex);
+            if (error) {
+              console.error(`[Worker ${i}] error reading block ${blockIndex}:`, error);
+            } else {
+              callback(buffer);
+            }
+          }
+        };
+        senderWorkersRef.current.push(w);
+      }
+    }
+    return senderWorkersRef.current;
+  }, []);
+
+  const getReceiverWorker = useCallback(() => {
+    if (!receiverWorkerRef.current) {
+      const workerBlob = new Blob([`
+        let chunks = [];
+        let receivedBytes = 0;
+        self.onmessage = function(e) {
+          const { type, chunk, meta } = e.data;
+          if (type === 'init') {
+            chunks = [];
+            receivedBytes = 0;
+          } else if (type === 'chunk') {
+            chunks.push(chunk);
+            receivedBytes += chunk.byteLength;
+          } else if (type === 'compile') {
+            try {
+              const blob = new Blob(chunks, { type: meta.type || 'application/octet-stream' });
+              chunks = [];
+              if (typeof self.URL !== 'undefined' && typeof self.URL.createObjectURL === 'function') {
+                const url = self.URL.createObjectURL(blob);
+                self.postMessage({ type: 'complete', url });
+              } else {
+                self.postMessage({ type: 'complete', blob });
+              }
+            } catch (err) {
+              self.postMessage({ type: 'error', error: err ? err.toString() : 'Unknown error' });
+            }
+          }
+        };
+      `], { type: 'application/javascript' });
+      const workerUrl = URL.createObjectURL(workerBlob);
+      receiverWorkerRef.current = new Worker(workerUrl);
+    }
+    return receiverWorkerRef.current;
+  }, []);
+
   const inputRefs = [
     useRef<HTMLInputElement | null>(null),
     useRef<HTMLInputElement | null>(null),
@@ -206,7 +284,15 @@ export default function Home() {
     const timer = setTimeout(() => {
       setIsClient(true);
     }, 0);
-    return () => clearTimeout(timer);
+    const activeSenderWorkers = senderWorkersRef.current;
+    const activeReceiverWorker = receiverWorkerRef.current;
+    return () => {
+      clearTimeout(timer);
+      activeSenderWorkers.forEach(w => w.terminate());
+      if (activeReceiverWorker) {
+        activeReceiverWorker.terminate();
+      }
+    };
   }, []);
 
   // Sync state values to refs for stable reference in async callbacks
@@ -532,6 +618,9 @@ export default function Home() {
             receivedBytesRef.current = 0;
             prevStatsTimeRef.current = 0;
 
+            const rWorker = getReceiverWorker();
+            rWorker.postMessage({ type: 'init' });
+
             setStats({
               fileName: msg.name,
               fileSize: msg.size,
@@ -554,7 +643,11 @@ export default function Home() {
       } else {
         // Binary Chunk (ArrayBuffer)
         const chunk = event.data as ArrayBuffer;
-        chunksReceivedRef.current.push(chunk);
+        
+        // Zero-copy transfer to background receiver worker
+        const rWorker = getReceiverWorker();
+        rWorker.postMessage({ type: 'chunk', chunk }, [chunk]);
+
         receivedBytesRef.current += chunk.byteLength;
         const receivedBytes = receivedBytesRef.current;
 
@@ -585,32 +678,45 @@ export default function Home() {
           }
 
           if (isComplete) {
-            addDebugLog('All file chunks received completely!', 'success');
+            addDebugLog('All file chunks received completely! Initiating background thread compilation...', 'success');
+            
+            rWorker.postMessage({ type: 'compile', meta });
+            rWorker.onmessage = (e) => {
+              const { type, url, blob, error } = e.data;
+              if (type === 'complete') {
+                const finalUrl = url || (blob ? URL.createObjectURL(blob) : '');
+                addDebugLog('File compiled successfully on background thread!', 'success');
 
-            const newFileId = Math.random().toString(36).substring(2, 9);
-            const newQueuedFile = {
-              id: newFileId,
-              name: meta.name,
-              size: meta.size,
-              type: meta.type || 'application/octet-stream',
-              chunks: [...chunksReceivedRef.current],
-              downloaded: false,
-              receivedBytes: receivedBytes,
-            };
+                const newFileId = Math.random().toString(36).substring(2, 9);
+                const newQueuedFile = {
+                  id: newFileId,
+                  name: meta.name,
+                  size: meta.size,
+                  type: meta.type || 'application/octet-stream',
+                  chunks: [], // Keeps memory bounded and clean
+                  blobUrl: finalUrl,
+                  downloaded: false,
+                  receivedBytes: receivedBytes,
+                };
 
-            setDownloadQueue((prev) => {
-              if (prev.some(f => f.name === meta.name && f.size === meta.size && f.chunks.length === chunksReceivedRef.current.length)) {
-                return prev;
+                setDownloadQueue((prev) => {
+                  if (prev.some(f => f.name === meta.name && f.size === meta.size && f.receivedBytes === receivedBytes)) {
+                    return prev;
+                  }
+                  return [...prev, newQueuedFile];
+                });
+
+                setStatus('complete');
+              } else if (type === 'error') {
+                console.error(error);
+                setError('Failed to compile received chunks.');
               }
-              return [...prev, newQueuedFile];
-            });
-
-            setStatus('complete');
+            };
           }
         }
       }
     };
-  }, [handleDisconnect, addDebugLog, setDownloadQueue]);
+  }, [handleDisconnect, addDebugLog, setDownloadQueue, getReceiverWorker]);
 
   // --- RECEIVER ANSWER CREATION ---
   const handleOffer = useCallback(async (sdp: RTCSessionDescriptionInit) => {
@@ -1160,15 +1266,16 @@ export default function Home() {
       startTime: Date.now(),
     });
 
-    // Dynamic chunk size selection based on file size for optimal overhead vs compatibility
-    const CHUNK_SIZE = totalSize > 20 * 1024 * 1024 
-      ? 262144  // 256KB for files > 20MB
-      : totalSize > 2 * 1024 * 1024 
-        ? 131072 // 128KB for files > 2MB
+    // Dynamic chunk size selection: 512KB for files > 5MB to achieve maximum throughput
+    const CHUNK_SIZE = totalSize > 5 * 1024 * 1024 
+      ? 524288  // 512KB for files > 5MB
+      : totalSize > 512 * 1024 
+        ? 262144 // 256KB for files > 512KB
         : 65536; // 64KB for small files
 
-    const HIGH_WATERMARK = Math.max(4194304, CHUNK_SIZE * 32); // 4MB - 8MB high watermark
-    const LOW_WATERMARK = Math.max(1048576, CHUNK_SIZE * 8);  // 1MB - 2MB low watermark threshold
+    // Scale watermarks to handle the high throughput without stalling or memory starvation
+    const HIGH_WATERMARK = Math.max(16777216, CHUNK_SIZE * 32); // 16MB high watermark
+    const LOW_WATERMARK = Math.max(4194304, CHUNK_SIZE * 8);    // 4MB low watermark
     
     let offset = 0;
     const startTime = Date.now();
@@ -1182,10 +1289,13 @@ export default function Home() {
       console.warn('Could not set bufferedAmountLowThreshold:', e);
     }
 
-    // SPEED OPTIMIZATION 1: If file is <= 100MB, pre-read the entire file into memory as a single ArrayBuffer.
-    // This bypasses asynchronous file slice reading overhead completely during network transmission.
+    // SPEED OPTIMIZATION 1: If file is <= 100MB, pre-read the entire file on a background worker thread.
+    // This offloads all disk read & buffer allocation off the main UI thread entirely!
     if (totalSize <= 100 * 1024 * 1024) {
-      file.arrayBuffer().then((entireBuffer) => {
+      const pool = getSenderWorkerPool();
+      const w = pool[0];
+
+      blockCallbacksRef.current.set(0, (entireBuffer) => {
         if (dc.readyState !== 'open') return;
 
         const sendFromBuffer = () => {
@@ -1246,17 +1356,16 @@ export default function Home() {
 
         // Start sending
         sendFromBuffer();
-      }).catch((err) => {
-        console.error('Error reading entire file buffer:', err);
-        setError('Failed to read file.');
-        handleDisconnect(true, false);
       });
+
+      w.postMessage({ file, blockStart: 0, actualBlockSize: totalSize, blockIndex: 0 });
       return;
     }
 
     // SPEED OPTIMIZATION 2: Block-Based sliding window pipeline for files > 100MB.
     // Instead of reading thousands of small slices asynchronously (causing excessive Promise, GC & I/O overhead),
-    // we read the file in large 8MB blocks asynchronously, then slice chunks from each block completely synchronously.
+    // we read the file in large 8MB blocks asynchronously across a multi-threaded Worker Pool,
+    // then slice chunks from each block completely synchronously.
     const BLOCK_SIZE = 8 * 1024 * 1024; // 8MB block sizes
     const MAX_PRELOAD_BLOCKS = 3; // Keep up to 24MB maximum preloaded in RAM (safely bounded)
     
@@ -1270,7 +1379,7 @@ export default function Home() {
       const maxBlockIndex = Math.ceil(totalSize / BLOCK_SIZE) - 1;
 
       while (
-        activeBlockReads.size < 2 && // Up to 2 concurrent disk reads to serialize flash memory access
+        activeBlockReads.size < 3 && // Up to 3 concurrent worker reads to leverage multi-core I/O parallelism
         loadedBlocks.size < MAX_PRELOAD_BLOCKS
       ) {
         let targetBlock = -1;
@@ -1287,21 +1396,18 @@ export default function Home() {
 
         const blockStart = blockToLoad * BLOCK_SIZE;
         const actualBlockSize = Math.min(BLOCK_SIZE, totalSize - blockStart);
-        const slice = file.slice(blockStart, blockStart + actualBlockSize);
+        
+        const pool = getSenderWorkerPool();
+        const w = pool[blockToLoad % pool.length];
 
-        slice.arrayBuffer()
-          .then((buffer) => {
-            activeBlockReads.delete(blockToLoad);
-            loadedBlocks.set(blockToLoad, buffer);
-            preloadBlocks();
-            sendFromBlocks();
-          })
-          .catch((err) => {
-            console.error('Error preloading file block:', err);
-            activeBlockReads.delete(blockToLoad);
-            setError('Error reading file. Please try again.');
-            handleDisconnect(true, false);
-          });
+        blockCallbacksRef.current.set(blockToLoad, (buffer) => {
+          activeBlockReads.delete(blockToLoad);
+          loadedBlocks.set(blockToLoad, buffer);
+          preloadBlocks();
+          sendFromBlocks();
+        });
+
+        w.postMessage({ file, blockStart, actualBlockSize, blockIndex: blockToLoad });
       }
     };
 
@@ -1355,9 +1461,9 @@ export default function Home() {
               speed,
               remainingTime,
               startTime,
-                });
-              }
-            }
+            });
+          }
+        }
 
         if (offset >= totalSize) {
           dc.removeEventListener('bufferedamountlow', handleBufferedAmountLow);
@@ -1387,21 +1493,30 @@ export default function Home() {
   // --- RECEIVER: DOWNLOAD FILE ENGINE ---
   const downloadFile = () => {
     const meta = receivedMetadataRef.current;
-    const chunks = chunksReceivedRef.current;
-    if (!meta || chunks.length === 0) {
+    if (!meta) {
       setError('No file segments found to download.');
       return;
     }
 
-    const blob = new Blob(chunks, {type: meta.type || 'application/octet-stream'});
-    const url = URL.createObjectURL(blob);
+    // Find if the file exists in the downloadQueue to see if we can use its blobUrl
+    const queuedFile = downloadQueue.find(f => f.name === meta.name && f.size === meta.size);
+    let url = queuedFile && queuedFile.blobUrl ? queuedFile.blobUrl : '';
+
+    if (!url) {
+      const chunks = chunksReceivedRef.current;
+      if (chunks.length === 0) {
+        setError('No file segments found to download.');
+        return;
+      }
+      const blob = new Blob(chunks, {type: meta.type || 'application/octet-stream'});
+      url = URL.createObjectURL(blob);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
 
     const a = document.createElement('a');
     a.href = url;
     a.download = meta.name;
     a.click();
-
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
 
     // Notify sender that receiver downloaded
     sendSignalMessage({type: 'download-complete'});
@@ -1415,21 +1530,22 @@ export default function Home() {
     setStatus('connected');
   };
 
-  const downloadSingleFile = useCallback((file: { id: string; name: string; size: number; type: string; chunks: ArrayBuffer[]; downloaded: boolean; receivedBytes: number }) => {
-    if (!file || file.chunks.length === 0) {
-      setError('No file segments found to download.');
-      return;
+  const downloadSingleFile = useCallback((file: { id: string; name: string; size: number; type: string; chunks: ArrayBuffer[]; downloaded: boolean; receivedBytes: number; blobUrl?: string }) => {
+    let url = file.blobUrl || '';
+    if (!url) {
+      if (!file || file.chunks.length === 0) {
+        setError('No file segments found to download.');
+        return;
+      }
+      const blob = new Blob(file.chunks, {type: file.type || 'application/octet-stream'});
+      url = URL.createObjectURL(blob);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
-
-    const blob = new Blob(file.chunks, {type: file.type || 'application/octet-stream'});
-    const url = URL.createObjectURL(blob);
 
     const a = document.createElement('a');
     a.href = url;
     a.download = file.name;
     a.click();
-
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
 
     // Notify sender that receiver downloaded
     sendSignalMessage({type: 'download-complete'});
